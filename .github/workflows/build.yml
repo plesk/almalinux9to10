@@ -1,0 +1,32 @@
+name: Build with Buck
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04 # Not latest, because python3.6 is not available on latest
+                          # https://github.com/actions/setup-python/issues/544
+    steps:
+    - name: Checkout repository and submodules
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        # We use tags to determine version, so fetch them
+        fetch-depth: 0
+        fetch-tags: true
+    # Workaround for https://github.com/actions/checkout/issues/882
+    - name: Explicitly fetch tags
+      run: git fetch --force --tags
+    - name: Prepare artifact store
+      run: mkdir -p ./buck-out/gen
+    - name: Build almalinux9to10
+      id: build
+      uses: SandakovMM/build-with-buck@v6
+      with:
+        command: build
+        target: :almalinux9to10
+    - name: Store result
+      uses: actions/upload-artifact@v4
+      with:
+        name: almalinux9to10
+        path: ./buck-out/gen/almalinux9to10

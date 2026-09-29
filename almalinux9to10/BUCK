@@ -1,0 +1,28 @@
+# Copyright 1999 - 2026. WebPros International GmbH. All rights reserved.
+# vim:ft=python:
+
+include_defs('//product.defs.py')
+
+
+genrule(
+    name = 'config',
+    srcs = ['config.py'],
+    out = 'config.py',
+    bash = '''\
+        PRODUCT_VERSION='{version}'
+        PRODUCT_REVISION='{revision}'
+        sed -e "s/@@PRODUCT_VERSION@@/$PRODUCT_VERSION/g; s/@@PRODUCT_REVISION@@/$PRODUCT_REVISION/g" "$SRCS" >"$OUT"
+    '''.format(
+        version=get_product_version(),
+        revision=get_git_revision(),
+    ),
+)
+
+python_library(
+    name = 'lib',
+    srcs = glob(
+        ['**/*.py'],
+        exclude = ['config.py'],
+    ) + [':config'],
+    visibility = ['PUBLIC'],
+)
