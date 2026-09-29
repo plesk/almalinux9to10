@@ -1,0 +1,253 @@
+# Copyright 1999 - 2026. WebPros International GmbH. All rights reserved.
+
+# https://access.redhat.com/solutions/6900331
+# Migrating custom network scripts to NetworkManager dispatcher scripts
+#  Solution Verified - Updated June 13 2024 at 9:30 PM
+
+import glob
+import os
+import shutil
+import typing
+
+from pleskdistup.common import action, files, log, util
+
+NM_SCRIPTS_DIR = "/opt/network-scripts"
+IF_SBIN_SCRIPTS_PATTERN = "/sbin/if*-local"
+NM_IF_SCRIPTS_PATTERN = "/opt/network-scripts/if*-local"
+NW_SCRIPTS_DEVICE_GLOB = "/etc/sysconfig/network-scripts/ifcfg-*"
+
+NM_IFLOCAL_SCRIPT_PATH = "/etc/NetworkManager/dispatcher.d/20-if-local"
+NM_IFLOCAL_SCRIPT = """#!/bin/bash
+
+test -n "$DEVICE_IFACE" || exit 0
+
+run() {{
+    if [ -x "/sbin/$1" ]; then
+        "/sbin/$1" "$DEVICE_IFACE"
+        return $?
+    fi
+
+    test -x "{0}/$1" || return 0
+    "{0}/$1" "$DEVICE_IFACE"
+    return $?
+}}
+
+case "$2" in
+    "up")
+        run ifup-local
+        ;;
+    "pre-up")
+        run ifup-pre-local
+        ;;
+    "down")
+        run ifdown-local
+        ;;
+    "pre-down")
+        run ifdown-pre-local
+        ;;
+esac
+""".format(NM_SCRIPTS_DIR)
+
+
+class CheckDeprecatedIFScripts(action.CheckAction):
+    def __init__(self) -> None:
+        self.name = "check for deprecated custom network scripts"
+        self.description = """There are deprecated custom network scripts: {}.
+Either pass `--fix-deprecated-if-scripts` argument in order to fix it by https://access.redhat.com/solutions/6900331 or manually address&remove these.
+"""
+
+    def _do_check(self) -> bool:
+        scripts = glob.glob(IF_SBIN_SCRIPTS_PATTERN)
+        if len(scripts) == 0:
+            return True
+        self.description = self.description.format(", ".join(scripts))
+        return False
+
+
+class FixDeprecatedIFScripts(action.ActiveAction):
+    def __init__(self) -> None:
+        self.name = "fix custom network scripts"
+
+    def is_required(self) -> bool:
+        return bool(glob.glob(IF_SBIN_SCRIPTS_PATTERN))
+
+    def _prepare_action(self) -> action.ActionResult:
+        os.makedirs(NM_SCRIPTS_DIR, exist_ok=True)
+        with open(NM_IFLOCAL_SCRIPT_PATH, "w") as f:
+            f.write(NM_IFLOCAL_SCRIPT)
+        os.chmod(NM_IFLOCAL_SCRIPT_PATH, 0o755)
+        util.logged_check_call(["/usr/sbin/restorecon", NM_IFLOCAL_SCRIPT_PATH])
+        for file_path in glob.glob(IF_SBIN_SCRIPTS_PATTERN):
+            shutil.move(file_path, NM_SCRIPTS_DIR)
+        return action.ActionResult()
+
+    def _post_action(self) -> action.ActionResult:
+        return action.ActionResult()
+
+    def _revert_action(self) -> action.ActionResult:
+        for file_path in glob.glob(NM_IF_SCRIPTS_PATTERN):
+            shutil.move(file_path, "/sbin/")
+        if not os.listdir(NM_SCRIPTS_DIR):
+            os.rmdir(NM_SCRIPTS_DIR)
+        return action.ActionResult()
+
+    def estimate_post_time(self) -> int:
+        return 1
+
+
+class CheckNMUnreachableDevices(action.CheckAction):
+    def __init__(self) -> None:
+        self.name = "check for network-scripts ifcfg-* devices which can't be controlled via NetworkManager"
+        self.description = """There are network-scripts device definitions
+which are explicitly disabled for NetworkManager control: {}.
+Make sure they are NM_CONTROLLED and behave fine with NetworkManager operations.
+"""
+
+    def _check_file(self, fpath: str) -> bool:
+        with open(fpath) as f:
+            for ln in f:
+                pp = ln.partition("=")
+                if not pp[1]:
+                    continue
+                if pp[0].strip() == "NM_CONTROLLED" and \
+                   pp[2].strip().lower() == "no":
+                    return False
+        return True
+
+    def _do_check(self) -> bool:
+        devs = glob.glob(NW_SCRIPTS_DEVICE_GLOB)
+        ll = [d for d in devs if not self._check_file(d)]
+        if not ll:
+            return True
+        self.description = self.description.format(", ".join(ll))
+        return False
+
+
+NETWORK_SCRIPTS_DIR = "/etc/sysconfig/network-scripts"
+NM_CONFIG_GLOBS = ["/etc/NetworkManager/NetworkManager.conf", "/etc/NetworkManager/conf.d/*.conf"]
+
+
+class AssertNoLegacyNetworkConfiguration(action.CheckAction):
+    """Mirror of the leapp el9toel10 'network_deprecations' inhibitor.
+
+    Leapp refuses the conversion when the legacy ifcfg configuration is still
+    in place, but only during 'leapp preupgrade', which happens deep inside the
+    conversion. Checking it up front keeps the failure in the preparation checks.
+    """
+
+    def __init__(self) -> None:
+        self.name = "checking for legacy ifcfg network configuration"
+        self.description = """Legacy network configuration in the 'ifcfg' format was found: {}
+\tAlmaLinux 10 ignores these files, so leapp will refuse the conversion.
+\tConvert the configuration into the NetworkManager native 'keyfile' format by calling:
+\t- `nmcli connection migrate`
+\tSee https://access.redhat.com/solutions/7083803 for the details.
+\tIf the files reappear after a reboot, they are regenerated by cloud-init or by a
+\tprovisioning agent. Stop it from managing the network by creating
+\t'/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg' with:
+\t\tnetwork: {{config: disabled}}
+\tand remove the leftover files afterwards. Only do that when the addresses are
+\talready stored as NetworkManager keyfile profiles, otherwise the server loses
+\tits network configuration on the next boot.
+\tWith stock cloud-init the 'renderers: ['network-manager']' setting under
+\t'system_info: network:' works as well, but some provisioning agents ignore it.
+{}"""
+
+    def _get_legacy_files(self) -> typing.Dict[str, typing.Dict[str, str]]:
+        # Leapp groups the files by connection name, so 'ifcfg-eth0' and
+        # 'rule-eth0' are recognized as parts of the same configuration.
+        connections: typing.Dict[str, typing.Dict[str, str]] = {}
+        for kind in ("ifcfg", "rule", "rule6"):
+            for path in glob.glob(os.path.join(NETWORK_SCRIPTS_DIR, f"{kind}-*")):
+                name = os.path.basename(path).split("-", 1)[1]
+                connections.setdefault(name, {})[kind] = path
+
+        return connections
+
+    def _get_dhclient_configs(self) -> typing.List[str]:
+        # The dhclient DHCP plugin is removed in AlmaLinux 10 and leapp inhibits on it too
+        configs = []
+        for config_glob in NM_CONFIG_GLOBS:
+            for path in glob.glob(config_glob):
+                try:
+                    with open(path) as config:
+                        if any(line.strip().replace(" ", "") == "dhcp=dhclient" for line in config):
+                            configs.append(path)
+                except OSError as ex:
+                    log.warn(f"Unable to read the NetworkManager configuration {path!r}: {ex}")
+
+        return configs
+
+    def _do_check(self) -> bool:
+        connections = self._get_legacy_files()
+        dhclient_configs = self._get_dhclient_configs()
+        if not connections and not dhclient_configs:
+            return True
+
+        problems = []
+        for name in sorted(connections):
+            connection = connections[name]
+            files_list = ", ".join(sorted(connection.values()))
+            if "ifcfg" not in connection:
+                problems.append(f"{files_list} (leftovers of an incomplete migration, remove them)")
+            elif "rule" in connection or "rule6" in connection:
+                problems.append(
+                    f"{files_list} (legacy routing rules, replace them with the 'ipv4.routing-rules' "
+                    "or 'ipv6.routing-rules' properties before the migration)"
+                )
+            else:
+                problems.append(files_list)
+
+        dhclient_note = ""
+        if dhclient_configs:
+            dhclient_note = (
+                "\tThe deprecated 'dhcp=dhclient' plugin is configured in: {}\n"
+                "\tRemove the 'dhcp=dhclient' line from the '[main]' section of these files.\n"
+            ).format(", ".join(sorted(dhclient_configs)))
+
+        self.description = self.description.format(", ".join(problems) or "none", dhclient_note)
+        return False
+
+
+class MigrateLegacyNetworkConfiguration(action.ActiveAction):
+    """Convert legacy ifcfg configuration into the NetworkManager keyfile format.
+
+    'nmcli connection migrate' rewrites the stored profiles without touching the
+    active connection, so the network stays up while the files change. Leftover
+    files nmcli does not own are removed afterwards, because leapp inhibits the
+    conversion on those too.
+    """
+
+    def __init__(self) -> None:
+        self.name = "migrating legacy network configuration to the keyfile format"
+
+    def _get_legacy_files(self) -> typing.List[str]:
+        legacy = []
+        for kind in ("ifcfg", "rule", "rule6", "keys", "route", "route6"):
+            legacy += glob.glob(os.path.join(NETWORK_SCRIPTS_DIR, f"{kind}-*"))
+
+        return sorted(legacy)
+
+    def _is_required(self) -> bool:
+        return bool(self._get_legacy_files())
+
+    def _prepare_action(self) -> action.ActionResult:
+        util.logged_check_call(["/usr/bin/nmcli", "connection", "migrate"])
+
+        for leftover in self._get_legacy_files():
+            log.info(f"Removing the legacy network configuration file {leftover!r} left by the migration")
+            files.backup_file(leftover)
+            os.unlink(leftover)
+
+        return action.ActionResult()
+
+    def _post_action(self) -> action.ActionResult:
+        return action.ActionResult()
+
+    def _revert_action(self) -> action.ActionResult:
+        for backup in glob.glob(os.path.join(NETWORK_SCRIPTS_DIR, "*")):
+            files.restore_file_from_backup(backup)
+        return action.ActionResult()
+
+    def estimate_prepare_time(self) -> int:
+        return 10
